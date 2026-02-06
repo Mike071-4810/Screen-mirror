@@ -1,0 +1,264 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Screen Share WebRTC</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <!-- Librería ligera para generar QR -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
+    <style>
+        body { font-family: 'Inter', sans-serif; background-color: #0f172a; color: white; }
+        .hidden { display: none !important; }
+        video { width: 100%; max-height: 80vh; background: black; border-radius: 8px; }
+    </style>
+</head>
+<body class="h-screen flex flex-col items-center justify-center p-4">
+
+    <!-- VISTA: ORDENADOR (RECEPTOR) -->
+    <div id="receiver-view" class="hidden text-center max-w-2xl w-full">
+        <h1 class="text-3xl font-bold mb-2">Escanea para compartir</h1>
+        <p class="text-gray-400 mb-8">Abre la cámara de tu teléfono y escanea el código.</p>
+        
+        <div id="qr-container" class="bg-white p-4 rounded-lg inline-block mb-6">
+            <div id="qrcode"></div>
+        </div>
+
+        <div id="status-receiver" class="text-yellow-400 font-mono text-sm animate-pulse">Esperando conexión...</div>
+        
+        <div id="video-container" class="hidden mt-4 w-full">
+            <video id="remote-video" autoplay playsinline controls></video>
+        </div>
+    </div>
+
+    <!-- VISTA: MÓVIL (EMISOR) -->
+    <div id="sender-view" class="hidden text-center max-w-md w-full">
+        <div class="mb-6">
+            <div class="w-16 h-16 bg-blue-600 rounded-full flex items-center justify-center mx-auto mb-4">
+                <svg xmlns="http://www.w3.org/2000/svg" class="h-8 w-8 text-white" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9.75 17L9 20l-1 1h8l-1-1-.75-3M3 13h18M5 17h14a2 2 0 002-2V5a2 2 0 00-2-2H5a2 2 0 00-2 2v10a2 2 0 002 2z" />
+                </svg>
+            </div>
+            <h2 class="text-2xl font-bold">Compartir Pantalla</h2>
+            <p class="text-gray-400 mt-2">Estás conectado a la PC.</p>
+        </div>
+
+        <button id="start-share-btn" class="w-full bg-blue-600 hover:bg-blue-700 text-white font-bold py-4 px-6 rounded-xl shadow-lg transition transform active:scale-95 flex items-center justify-center gap-2">
+            <span>Iniciar Transmisión</span>
+        </button>
+        
+        <p id="status-sender" class="mt-4 text-sm text-gray-500 font-mono"></p>
+    </div>
+
+    <script>
+        // --- CONFIGURACIÓN ---
+        const signalingUrl = location.origin.replace(/^http/, 'ws'); // WebSocket relativo al host
+        const stunServers = {
+            iceServers: [
+                { urls: 'stun:stun.l.google.com:19302' },
+                { urls: 'stun:stun1.l.google.com:19302' }
+            ]
+        };
+
+        // --- ESTADO ---
+        let ws;
+        let peerConnection;
+        let localStream;
+        const urlParams = new URLSearchParams(window.location.search);
+        const roomId = urlParams.get('room');
+        const isReceiver = !roomId; // Si no hay room en URL, soy el PC (Receptor)
+
+        // Elementos DOM
+        const receiverView = document.getElementById('receiver-view');
+        const senderView = document.getElementById('sender-view');
+        const statusReceiver = document.getElementById('status-receiver');
+        const statusSender = document.getElementById('status-sender');
+        const remoteVideo = document.getElementById('remote-video');
+        const btnShare = document.getElementById('start-share-btn');
+
+        // --- INICIO ---
+        function init() {
+            connectWebSocket();
+
+            if (isReceiver) {
+                setupReceiver();
+            } else {
+                setupSender();
+            }
+        }
+
+        // --- WEBSOCKET CONNECTION ---
+        function connectWebSocket() {
+            ws = new WebSocket(signalingUrl);
+
+            ws.onopen = () => {
+                console.log("WS Conectado");
+                if (isReceiver) {
+                    // Generar ID único para la sala si soy el host
+                    const newRoomId = generateUUID();
+                    ws.send(JSON.stringify({ type: 'create', roomId: newRoomId }));
+                    generateQR(newRoomId);
+                } else {
+                    // Unirse a la sala existente
+                    ws.send(JSON.stringify({ type: 'join', roomId: roomId }));
+                    statusSender.innerText = "Conectado al servidor. Pulsa el botón.";
+                }
+            };
+
+            ws.onmessage = async (event) => {
+                const data = JSON.parse(event.data);
+                handleSignalingData(data);
+            };
+        }
+
+        // --- LÓGICA DE SEÑALIZACIÓN ---
+        async function handleSignalingData(data) {
+            if (data.type === 'offer') {
+                // (PC) Recibe oferta del móvil
+                await createPeerConnection();
+                await peerConnection.setRemoteDescription(new RTCSessionDescription(data.offer));
+                const answer = await peerConnection.createAnswer();
+                await peerConnection.setLocalDescription(answer);
+                ws.send(JSON.stringify({ type: 'answer', roomId: isReceiver ? getCurrentRoomId() : roomId, answer }));
+                
+            } else if (data.type === 'answer') {
+                // (Móvil) Recibe respuesta del PC
+                await peerConnection.setRemoteDescription(new RTCSessionDescription(data.answer));
+
+            } else if (data.type === 'candidate') {
+                // (Ambos) Candidatos ICE para atravesar NAT
+                if (peerConnection) {
+                    await peerConnection.addIceCandidate(new RTCIceCandidate(data.candidate));
+                }
+
+            } else if (data.type === 'user-joined') {
+                if (isReceiver) {
+                    statusReceiver.innerText = "Dispositivo detectado. Esperando permiso de pantalla...";
+                    statusReceiver.className = "text-blue-400 font-mono text-sm";
+                    document.getElementById('qr-container').classList.add('hidden'); // Ocultar QR
+                }
+            }
+        }
+
+        // --- FUNCIONES CORE WEBRTC ---
+
+        async function createPeerConnection() {
+            peerConnection = new RTCPeerConnection(stunServers);
+
+            // Manejar candidatos ICE (red)
+            peerConnection.onicecandidate = (event) => {
+                if (event.candidate) {
+                    ws.send(JSON.stringify({
+                        type: 'candidate',
+                        roomId: isReceiver ? getCurrentRoomId() : roomId,
+                        candidate: event.candidate
+                    }));
+                }
+            };
+
+            // (PC) Manejar flujo de video entrante
+            peerConnection.ontrack = (event) => {
+                console.log("Stream recibido");
+                remoteVideo.srcObject = event.streams[0];
+                document.getElementById('video-container').classList.remove('hidden');
+                statusReceiver.innerText = "Transmitiendo en vivo";
+                statusReceiver.className = "text-green-500 font-bold mb-4";
+            };
+
+            // (PC) Detectar si el móvil cuelga
+            peerConnection.onconnectionstatechange = () => {
+                if (peerConnection.connectionState === 'disconnected') {
+                    statusReceiver.innerText = "Desconectado.";
+                }
+            };
+        }
+
+        // --- LÓGICA RECEPTOR (PC) ---
+        function setupReceiver() {
+            receiverView.classList.remove('hidden');
+        }
+
+        function generateQR(id) {
+            // Guardamos el ID en una variable global o en el DOM para uso futuro
+            window.currentRoomId = id;
+            const link = `${window.location.href}?room=${id}`;
+            new QRCode(document.getElementById("qrcode"), {
+                text: link,
+                width: 180,
+                height: 180
+            });
+        }
+        
+        function getCurrentRoomId() {
+            return window.currentRoomId;
+        }
+
+        // --- LÓGICA EMISOR (MÓVIL) ---
+        function setupSender() {
+            senderView.classList.remove('hidden');
+
+            btnShare.addEventListener('click', async () => {
+                try {
+                    statusSender.innerText = "Solicitando permisos...";
+                    
+                    // 1. Capturar pantalla
+                    // Nota: En móviles esto suele pedir permiso cada vez
+                    localStream = await navigator.mediaDevices.getDisplayMedia({
+                        video: { cursor: "always" },
+                        audio: false // Simplificamos quitando audio por ahora
+                    });
+
+                    statusSender.innerText = "Estableciendo conexión P2P...";
+                    btnShare.classList.add('opacity-50', 'cursor-not-allowed');
+                    btnShare.disabled = true;
+
+                    // 2. Iniciar conexión WebRTC
+                    await createPeerConnection();
+
+                    // 3. Añadir tracks al stream
+                    localStream.getTracks().forEach(track => {
+                        peerConnection.addTrack(track, localStream);
+                        
+                        // Detectar si el usuario detiene la captura desde la UI del navegador
+                        track.onended = () => {
+                            statusSender.innerText = "Transmisión finalizada por el usuario.";
+                            btnShare.disabled = false;
+                            btnShare.classList.remove('opacity-50', 'cursor-not-allowed');
+                            ws.close(); // o reiniciar lógica
+                        };
+                    });
+
+                    // 4. Crear Oferta (Sender initiates)
+                    const offer = await peerConnection.createOffer();
+                    await peerConnection.setLocalDescription(offer);
+
+                    // 5. Enviar oferta al servidor -> PC
+                    ws.send(JSON.stringify({
+                        type: 'offer',
+                        roomId: roomId,
+                        offer: offer
+                    }));
+
+                } catch (err) {
+                    console.error("Error:", err);
+                    statusSender.innerText = "Error: " + err.message;
+                    btnShare.disabled = false;
+                    btnShare.classList.remove('opacity-50', 'cursor-not-allowed');
+                }
+            });
+        }
+
+        // Utilidad UUID simple
+        function generateUUID() {
+            return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function(c) {
+                var r = Math.random() * 16 | 0, v = c == 'x' ? r : (r & 0x3 | 0x8);
+                return v.toString(16);
+            });
+        }
+
+        // Arrancar app
+        init();
+
+    </script>
+</body>
+</html>
